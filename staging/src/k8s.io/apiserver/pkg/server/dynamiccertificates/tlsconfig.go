@@ -55,6 +55,8 @@ type DynamicServingCertificateController struct {
 	currentlyServedContent *dynamicCertificateContent
 	// currentServingTLSConfig holds a *tls.Config that will be used to serve requests
 	currentServingTLSConfig atomic.Value
+	// currentNameToCertificate holds a map of names to certificates for IP-based lookups
+	currentNameToCertificate atomic.Value
 
 	// queue only ever has one item, but it has nice error handling backoff/retry semantics
 	queue         workqueue.TypedRateLimitingInterface[string]
@@ -112,12 +114,21 @@ func (c *DynamicServingCertificateController) GetConfigForClient(clientHello *tl
 		return tlsConfigCopy, nil
 	}
 
-	ipCert, ok := tlsConfigCopy.NameToCertificate[host]
+	// Use our separate mapping instead of the deprecated NameToCertificate field
+	uncastNameToCert := c.currentNameToCertificate.Load()
+	if uncastNameToCert == nil {
+		return tlsConfigCopy, nil
+	}
+	nameToCertificate, ok := uncastNameToCert.(map[string]*tls.Certificate)
+	if !ok {
+		return tlsConfigCopy, nil
+	}
+
+	ipCert, ok := nameToCertificate[host]
 	if !ok {
 		return tlsConfigCopy, nil
 	}
 	tlsConfigCopy.Certificates = []tls.Certificate{*ipCert}
-	tlsConfigCopy.NameToCertificate = nil
 
 	return tlsConfigCopy, nil
 }
@@ -211,16 +222,19 @@ func (c *DynamicServingCertificateController) syncCerts(ctx context.Context) err
 	}
 
 	if len(newContent.sniCerts) > 0 {
-		newTLSConfigCopy.NameToCertificate, err = c.BuildNamedCertificates(ctx, newContent.sniCerts)
+		namedCertificates, err := c.BuildNamedCertificates(ctx, newContent.sniCerts)
 		if err != nil {
 			return fmt.Errorf("unable to build named certificate map: %v", err)
 		}
+
+		// Store the named certificates mapping separately for IP-based lookups
+		c.currentNameToCertificate.Store(namedCertificates)
 
 		// append all named certs. Otherwise, the go tls stack will think no SNI processing
 		// is necessary because there is only one cert anyway.
 		// Moreover, if servingCert is not set, the first SNI
 		// cert will become the default cert. That's what we expect anyway.
-		for _, sniCert := range newTLSConfigCopy.NameToCertificate {
+		for _, sniCert := range namedCertificates {
 			newTLSConfigCopy.Certificates = append(newTLSConfigCopy.Certificates, *sniCert)
 		}
 	}
